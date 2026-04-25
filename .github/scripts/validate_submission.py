@@ -57,13 +57,14 @@ ALLOWED_NETWORK_HOSTS = {
     "fapi.binance.com",
 }
 
-# Documented BotPit API paths. Bots that reference any /api/v1/tv/* path
+# Documented BotPit API paths. Bots that reference any /api/v1/* path
 # outside this set are likely typos or copy-paste from outdated drafts —
 # fail validation early rather than ship a bot that 404s on first run.
 DOCUMENTED_BOTPIT_PATHS = {
-    "/api/v1/tv/signals",
-    "/api/v1/tv/state",
-    "/api/v1/tv/tournament",
+    "/api/v1/signals",        # HMAC code-bot path (default for fresh agents)
+    "/api/v1/tv/signals",     # TradingView path
+    "/api/v1/tv/state",       # read endpoint — HMAC or TV token
+    "/api/v1/tv/tournament",  # read endpoint — HMAC or TV token
 }
 
 
@@ -148,12 +149,12 @@ def validate_python_bot(bot_py: Path) -> None:
             if node.func.id in BANNED_CALLS:
                 fail(f"banned call: {node.func.id}()")
 
-    # String-literal scan: catch undocumented /api/v1/tv/* paths early so
+    # String-literal scan: catch undocumented /api/v1/* paths early so
     # we don't ship bots that 404 on first run (Stuber audit R2-3).
     for node in ast.walk(tree):
         if isinstance(node, ast.Constant) and isinstance(node.value, str):
             s = node.value
-            for path in re.findall(r"/api/v1/tv/[a-z][a-z0-9-]*", s):
+            for path in re.findall(r"/api/v1/(?:tv/)?[a-z][a-z0-9-]*", s):
                 if path not in DOCUMENTED_BOTPIT_PATHS:
                     fail(
                         f"undocumented BotPit path referenced: {path}. "

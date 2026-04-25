@@ -1,5 +1,5 @@
 /**
- * BotPit minimal-but-safe TypeScript bot.
+ * BotPit minimal-but-safe TypeScript bot — HMAC code-bot path.
  *
  * Spec: https://www.botpit.io/llms.txt
  *
@@ -7,48 +7,44 @@
  *   1. Read /api/v1/tv/state              — what's actually true
  *   2. Run watchStops()                   — fire client-side stops if hit
  *   3. Run decide()                       — your strategy decides next action
- *   4. Apply the decision (sendSignal)    — POST /api/v1/tv/signals
+ *   4. Apply the decision (sendSignal)    — POST /api/v1/signals (HMAC-signed)
  *   5. Log a heartbeat                    — so you can verify uptime
  *
- * Why this shape: BotPit doesn't enforce server-side stops. If your bot
- * crashes between an entry and its stop, the position keeps running
- * unprotected. So the watcher must run on every tick.
- *
  * Where your strategy goes: the `decide()` function below. Everything
- * else is plumbing — leave it alone unless you're changing the bot's
- * shape (e.g. multi-pair).
+ * else is plumbing.
  */
+
+import crypto from "node:crypto";
 
 // ---------- Config ----------
 
 const API_BASE = process.env.BOTPIT_API_BASE ?? "https://www.botpit.io";
-const TOKEN = process.env.BOTPIT_TV_TOKEN;
+const PUBKEY = process.env.BOTPIT_AGENT_PUBKEY;
+const SECRET = process.env.BOTPIT_AGENT_SECRET;
 const PAIR = process.env.BOTPIT_PAIR ?? "BTC-USDT";
 const TICK_SECONDS = parseInt(process.env.BOTPIT_TICK_SECONDS ?? "10", 10);
 
-if (!TOKEN) {
+if (!PUBKEY || !SECRET) {
   console.error(
-    "BOTPIT_TV_TOKEN not set. Copy .env.example to .env and paste your aatv_ token."
+    "BOTPIT_AGENT_PUBKEY / BOTPIT_AGENT_SECRET not set. Copy .env.example to .env and paste the keypair from https://www.botpit.io/agents/<your-agent-id>."
   );
   process.exit(1);
 }
 
 // ---------- Strategy interface ----------
 
-type Action = "hold" | "open_long" | "open_short" | "close";
-
 type Decision =
   | { action: "hold" }
   | { action: "close" }
   | {
       action: "open_long" | "open_short";
-      sizePct: number;       // % of equity per trade
-      leverage: number;      // 1..20
-      stopPct: number;       // client-side stop distance %
-      takeProfitPct?: number; // optional TP distance %
+      sizePct: number;
+      leverage: number;
+      stopPct: number;
+      takeProfitPct?: number;
     };
 
-// ---------- API helpers ----------
+// ---------- API types ----------
 
 type Position = {
   pair: string;
@@ -74,82 +70,76 @@ type Fill = {
 type StateResponse = {
   tournament: { id: string; name: string | null; kind: string; ends_at: string };
   equity: {
-    starting_usd: number;
-    current_usd: number;
-    peak_usd: number;
-    return_pct: number;
-    drawdown_pct: number;
-    realized_pnl_usd: number;
-    unrealized_pnl_usd: number;
-    as_of: string | null;
+    starting_usd: number; current_usd: number; peak_usd: number;
+    return_pct: number; drawdown_pct: number;
+    realized_pnl_usd: number; unrealized_pnl_usd: number; as_of: string | null;
   };
   positions: Position[];
   recent_fills: Fill[];
   recent_signals: Array<{
-    signal_id: string;
-    nonce: number;
-    status: string;
-    reason_code: string | null;
-    reason: string | null;
-    t_received: string;
-    t_processed: string | null;
+    signal_id: string; nonce: number; status: string;
+    reason_code: string | null; reason: string | null;
+    t_received: string; t_processed: string | null;
   }>;
 };
 
 type TournamentResponse = {
   tournament: {
-    id: string;
-    name: string;
-    kind: string;
-    state: string;
-    starts_at: string;
-    ends_at: string;
+    id: string; name: string; kind: string; state: string;
+    starts_at: string; ends_at: string;
     league: { name: string; tier: number };
   };
   rules: {
-    starting_equity_usd: number;
-    leverage_cap: number;
+    starting_equity_usd: number; leverage_cap: number;
     allowed_pairs: string[];
-    fee_bps_taker: number;
-    fee_bps_maker: number;
-    slippage_bps_market: number;
+    fee_bps_taker: number; fee_bps_maker: number; slippage_bps_market: number;
     dq_threshold_pct: number;
   };
   scoring: { formula: string; drawdown_penalty_k: number };
 };
 
-const headers = {
-  Authorization: `Bearer ${TOKEN}`,
-  "Content-Type": "application/json",
-};
+// ---------- HMAC signing + API client ----------
+
+function sign(body: string): { "Agent-Arena-Key": string; "Agent-Arena-Signature": string } {
+  const t = Date.now();
+  const mac = crypto.createHmac("sha256", SECRET!).update(`${t}.${body}`).digest("hex");
+  return {
+    "Agent-Arena-Key": PUBKEY!,
+    "Agent-Arena-Signature": `t=${t},v1=${mac}`,
+  };
+}
 
 async function apiGet<T>(path: string): Promise<T> {
-  const res = await fetch(`${API_BASE}${path}`, { headers });
+  const res = await fetch(`${API_BASE}${path}`, {
+    headers: { ...sign(""), "Content-Type": "application/json" },
+  });
   if (!res.ok) throw new Error(`${path}: ${res.status} ${await res.text()}`);
   return (await res.json()) as T;
 }
 
 async function sendSignal(
-  event: string,
+  side: "long" | "short" | "close",
+  pair: string,
   sizePct: number,
-  leverage: number,
-  pair: string
+  leverage: number
 ): Promise<{ status: string }> {
-  const body = {
-    event,
-    pair,
-    size_pct_equity: sizePct,
-    leverage,
+  const bodyObj = {
     nonce: Date.now(),
+    pair,
+    side,
+    order_type: "market" as const,
+    size: { mode: "pct_equity" as const, value: sizePct },
+    leverage,
   };
-  const res = await fetch(`${API_BASE}/api/v1/tv/signals`, {
+  const body = JSON.stringify(bodyObj);
+  const res = await fetch(`${API_BASE}/api/v1/signals`, {
     method: "POST",
-    headers,
-    body: JSON.stringify(body),
+    headers: { ...sign(body), "Content-Type": "application/json" },
+    body,
   });
   if (res.status >= 400) {
     const text = await res.text();
-    console.warn(`[bot] signal rejected: ${res.status} ${text.slice(0, 200)}`);
+    console.warn(`[bot] signal rejected: ${res.status} ${text.slice(0, 240)}`);
     return { status: "rejected" };
   }
   return (await res.json()) as { status: string };
@@ -159,29 +149,19 @@ async function sendSignal(
 
 async function getMarkPrice(pair: string): Promise<number> {
   const symbol = pair.replace("-", "");
-  const res = await fetch(
-    `https://fapi.binance.com/fapi/v1/premiumIndex?symbol=${symbol}`
-  );
+  const res = await fetch(`https://fapi.binance.com/fapi/v1/premiumIndex?symbol=${symbol}`);
   if (!res.ok) throw new Error(`mark price ${res.status}`);
   const j = (await res.json()) as { markPrice: string };
   return parseFloat(j.markPrice);
 }
 
 // ---------- Local stop memory ----------
-//
-// Stops aren't persisted server-side. We remember them in-process. On
-// restart, the bot will see any open position via /state but won't know
-// the stop level — it'll re-enter "no stop" mode until the next entry.
-// That's safer than guessing.
 const memory: { stopPrice: number | null; takeProfitPrice: number | null } = {
   stopPrice: null,
   takeProfitPrice: null,
 };
 
 // ---------- Strategy — REPLACE ME ----------
-//
-// This is the only function your LLM needs to fill in. Read snap to
-// understand the world, return what to do next.
 
 type Snapshot = {
   equityUsd: number;
@@ -195,15 +175,10 @@ type Snapshot = {
 function decide(_snap: Snapshot, _markPrice: number): Decision {
   // PLACEHOLDER STRATEGY — replace with your own.
   //
-  // The shipped behaviour: do nothing. The bot enters the arena but never
-  // trades. Replace this function with your strategy.
-  //
   // Examples to ask your LLM for:
   //   - "Open long when mark price drops 1% from the 60-tick rolling high.
   //      Close when up 0.5% or down 1%."
   //   - "Buy when RSI(14) crosses below 30, close when it crosses above 70."
-  //   - "On the 1-hour boundary, flip to whichever side BTC funding rate is
-  //      paying."
   return { action: "hold" };
 }
 
@@ -214,21 +189,21 @@ function watchStops(snap: Snapshot, markPrice: number): Decision | null {
   const side = snap.openPosition.side;
   if (memory.stopPrice !== null) {
     if (side === "long" && markPrice <= memory.stopPrice) {
-      console.log(`[bot] STOP HIT (long) — mark ${markPrice} ≤ stop ${memory.stopPrice}`);
+      console.log(`[bot] STOP HIT (long) — mark ${markPrice} <= stop ${memory.stopPrice}`);
       return { action: "close" };
     }
     if (side === "short" && markPrice >= memory.stopPrice) {
-      console.log(`[bot] STOP HIT (short) — mark ${markPrice} ≥ stop ${memory.stopPrice}`);
+      console.log(`[bot] STOP HIT (short) — mark ${markPrice} >= stop ${memory.stopPrice}`);
       return { action: "close" };
     }
   }
   if (memory.takeProfitPrice !== null) {
     if (side === "long" && markPrice >= memory.takeProfitPrice) {
-      console.log(`[bot] TP HIT (long) — mark ${markPrice} ≥ tp ${memory.takeProfitPrice}`);
+      console.log(`[bot] TP HIT (long) — mark ${markPrice} >= tp ${memory.takeProfitPrice}`);
       return { action: "close" };
     }
     if (side === "short" && markPrice <= memory.takeProfitPrice) {
-      console.log(`[bot] TP HIT (short) — mark ${markPrice} ≤ tp ${memory.takeProfitPrice}`);
+      console.log(`[bot] TP HIT (short) — mark ${markPrice} <= tp ${memory.takeProfitPrice}`);
       return { action: "close" };
     }
   }
@@ -264,14 +239,12 @@ async function applyDecision(decision: Decision, snap: Snapshot): Promise<void> 
 
   if (decision.action === "open_long" || decision.action === "open_short") {
     if (snap.openPosition) {
-      console.log(
-        `[bot] decide() wants ${decision.action} but already ${snap.openPosition.side}; close first.`
-      );
+      console.log(`[bot] decide() wants ${decision.action} but already ${snap.openPosition.side}; close first.`);
       return;
     }
-    const event = decision.action === "open_long" ? "buy_entry" : "sell_entry";
-    const resp = await sendSignal(event, decision.sizePct, decision.leverage, PAIR);
-    console.log(`[bot] OPEN ${decision.action} sent → ${resp.status}`);
+    const side = decision.action === "open_long" ? "long" : "short";
+    const resp = await sendSignal(side, PAIR, decision.sizePct, decision.leverage);
+    console.log(`[bot] OPEN ${decision.action} sent -> ${resp.status}`);
     try {
       const mark = await getMarkPrice(PAIR);
       const stopPct = decision.stopPct;
@@ -283,9 +256,7 @@ async function applyDecision(decision: Decision, snap: Snapshot): Promise<void> 
         memory.stopPrice = mark * (1 + stopPct / 100);
         memory.takeProfitPrice = mark * (1 - tpPct / 100);
       }
-      console.log(
-        `[bot] stop set @ ${memory.stopPrice.toFixed(2)}, tp @ ${memory.takeProfitPrice.toFixed(2)}`
-      );
+      console.log(`[bot] stop set @ ${memory.stopPrice.toFixed(2)}, tp @ ${memory.takeProfitPrice.toFixed(2)}`);
     } catch (e) {
       console.warn(`[bot] couldn't set client-side stop: ${(e as Error).message}`);
     }
@@ -293,9 +264,9 @@ async function applyDecision(decision: Decision, snap: Snapshot): Promise<void> 
   }
 
   if (decision.action === "close") {
-    if (!snap.openPosition) return; // no-op
-    const resp = await sendSignal("close", 100, 1, PAIR);
-    console.log(`[bot] CLOSE sent → ${resp.status}`);
+    if (!snap.openPosition) return;
+    const resp = await sendSignal("close", PAIR, 100, 1);
+    console.log(`[bot] CLOSE sent -> ${resp.status}`);
     memory.stopPrice = null;
     memory.takeProfitPrice = null;
   }
@@ -344,7 +315,7 @@ async function run(): Promise<void> {
         lastHeartbeat = now;
       }
     } catch (e) {
-      console.warn(`[bot] tick failed: ${(e as Error).message} — backing off 5s`);
+      console.warn(`[bot] tick failed: ${(e as Error).message} -- backing off 5s`);
       await sleep(5000);
       continue;
     }

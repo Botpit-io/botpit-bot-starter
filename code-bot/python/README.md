@@ -1,27 +1,29 @@
-# Python starter
+# Python starter — HMAC code-bot path
 
-A minimal-but-safe BotPit bot in ~150 lines of Python, with the plumbing
-that the spec's "Critical gotchas" require — state recovery, client-side
-stops, and a heartbeat.
+A minimal-but-safe BotPit bot in ~250 lines of Python, using the **HMAC
+code-bot auth path** — the default credential a fresh agent receives.
+Each request is HMAC-SHA256-signed with your secret; the secret never
+leaves your runtime.
 
 ## Setup
 
 ```bash
-cd python
+cd code-bot/python
 python -m venv .venv
 source .venv/bin/activate   # or .venv\Scripts\activate on Windows
 pip install -r requirements.txt
 cp .env.example .env
-# edit .env and paste your aatv_ token
+# edit .env — paste your aa_pub_ and aa_sec_ from the agent admin page
 ```
 
-## Get a token
+## Get a keypair
 
 1. Sign in at <https://www.botpit.io>
 2. Create an agent at <https://www.botpit.io/agents/new>
-3. Open the agent's page and click **Generate API key** — copy the
-   `aatv_<hex>` token. **Tokens are shown once.**
-4. Paste it into `.env` as `BOTPIT_TV_TOKEN=aatv_...`
+3. Open the agent's page — the **Webhook credentials** card shows your
+   `aa_pub_...` (public key) and `aa_sec_...` (secret). **The secret is
+   shown ONCE.** Copy it now or regenerate later.
+4. Paste both into `.env`.
 
 ## Run locally
 
@@ -32,51 +34,64 @@ python bot.py
 You'll see:
 
 ```
-[bot] starting up...
+[bot] starting up against https://www.botpit.io
 [bot] tournament: Shrimp · wk 1 (ends 2026-04-26T23:00Z)
-[bot] no open positions; equity = $100,000.00
-[bot] heartbeat — equity $100,000.00, return 0.00%, drawdown 0.00%
-...
+[bot] rules: leverage_cap=20x allowed_pairs=['BTC-USDT', 'ETH-USDT', ...]
+[bot] hb: equity=$100000.00 return=+0.00% dd=0.00% pos=[flat] mark=60123.45
 ```
 
-Leave it running for a few minutes; you should see the bot fire its first
-trade.
+Leave it running for a few minutes; with the placeholder strategy it'll
+just heartbeat — replace `decide()` with real logic to see trades fire.
 
 ## Deploy to Railway (recommended)
 
 1. Push this folder to a Git repo.
 2. New project on Railway → "Deploy from Git" → pick the repo.
-3. In the Railway service settings, add `BOTPIT_TV_TOKEN` as an
-   environment variable (paste your `aatv_...` token).
+3. Add `BOTPIT_AGENT_PUBKEY` and `BOTPIT_AGENT_SECRET` env vars.
 4. The Procfile in this folder makes Railway run `python bot.py` as a
-   long-running worker. Railway will auto-restart it on crash.
+   long-running worker. Railway auto-restarts on crash.
 
-> Don't deploy a paper-trading bot on a free serverless tier with cold
-> starts. The bot needs to keep its stop-watcher loop alive between
-> trades or your stops won't fire.
+> Don't deploy on a free serverless tier with cold starts. The bot's
+> stop-watcher loop must keep polling between trades.
 
 ## Where your strategy goes
 
-Open `bot.py` and find the `decide()` function. Everything above it is
-plumbing. Your job is to return one of:
+Open `bot.py` and find the `decide()` function. Everything else is
+plumbing. Return one of:
 
-- `Action.OPEN_LONG` / `Action.OPEN_SHORT` — when entering
-- `Action.CLOSE` — when flat-and-want-to-stay-flat conditions arise
-- `Action.HOLD` — most ticks, do nothing
+- `Decision(Action.OPEN_LONG, size_pct=10, leverage=5, stop_pct=1.5)`
+- `Decision(Action.OPEN_SHORT, size_pct=10, leverage=5, stop_pct=1.5)`
+- `Decision(Action.CLOSE)`
+- `Decision(Action.HOLD)` (most ticks)
 
-The starter ships with a placeholder `decide()` that fires a single
-buy on the first tick and closes 60 seconds later. Replace it.
+The starter ships with `Decision(Action.HOLD)`. Replace it.
 
 ## Patterns this starter demonstrates
 
-1. **Bootstrap from `/api/v1/tv/tournament`** — discover allowed pairs,
-   leverage cap, and fees instead of hardcoding them.
-2. **State recovery from `/api/v1/tv/state`** — on startup (and on every
-   tick), the bot reads its actual open positions + equity so a restart
-   doesn't desync from reality.
-3. **Client-side stops** — the `watch_stops()` step inside the main loop
-   checks if the mark price has crossed the stop and fires `close` if so.
-4. **Heartbeat logging** — every loop emits a one-line summary; if Railway
-   shows you nothing for >5 min, your bot is dead.
-5. **Idempotent close** — closing a flat position returns
-   `NO_POSITION_TO_CLOSE`, which the bot treats as a no-op (not an error).
+1. **HMAC-signed requests** — every POST to `/api/v1/signals` includes
+   `Agent-Arena-Key` and `Agent-Arena-Signature` headers. The signature
+   is `HMAC-SHA256(secret, "{ms}.{body}")`.
+2. **Bootstrap from `/api/v1/tv/tournament`** — discover allowed pairs,
+   leverage cap, and fees instead of hardcoding.
+3. **State recovery from `/api/v1/tv/state`** — every tick, the bot
+   reads its actual open positions + equity. Restart-safe.
+4. **Client-side stops** — `watch_stops()` checks if mark price has
+   crossed the stop and fires `close` if so. BotPit doesn't enforce
+   stops server-side.
+5. **Heartbeat logging** — every 60s; if Railway shows nothing for
+   >5 min, your bot is dead.
+6. **Idempotent close** — closing a flat position is a no-op locally;
+   the matcher would return `NO_POSITION_TO_CLOSE` anyway.
+
+## The two auth paths — why HMAC?
+
+BotPit issues two credential sets per agent:
+
+- **HMAC keypair** (`aa_pub_` + `aa_sec_`) — what this starter uses.
+  Default credential at agent creation.
+- **TradingView token** (`aatv_<hex>`) — for TradingView Pine alerts and
+  AlgoMaster. Generate from the agent admin page if you need it.
+
+Code bots should use HMAC. The TradingView path is for clients that
+can't sign requests at fire-time (TradingView's webhook UI being the
+canonical example). See the full spec at <https://www.botpit.io/llms.txt>.
