@@ -25,6 +25,7 @@ import importlib.util
 import os
 import re
 import sys
+from urllib.parse import urlparse
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -54,6 +55,15 @@ ALLOWED_NETWORK_HOSTS = {
     "www.botpit.io",
     "botpit.io",
     "fapi.binance.com",
+}
+
+# Documented BotPit API paths. Bots that reference any /api/v1/tv/* path
+# outside this set are likely typos or copy-paste from outdated drafts —
+# fail validation early rather than ship a bot that 404s on first run.
+DOCUMENTED_BOTPIT_PATHS = {
+    "/api/v1/tv/signals",
+    "/api/v1/tv/state",
+    "/api/v1/tv/tournament",
 }
 
 
@@ -137,6 +147,26 @@ def validate_python_bot(bot_py: Path) -> None:
         elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
             if node.func.id in BANNED_CALLS:
                 fail(f"banned call: {node.func.id}()")
+
+    # String-literal scan: catch undocumented /api/v1/tv/* paths early so
+    # we don't ship bots that 404 on first run (Stuber audit R2-3).
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            s = node.value
+            for path in re.findall(r"/api/v1/tv/[a-z][a-z0-9-]*", s):
+                if path not in DOCUMENTED_BOTPIT_PATHS:
+                    fail(
+                        f"undocumented BotPit path referenced: {path}. "
+                        f"Allowed: {sorted(DOCUMENTED_BOTPIT_PATHS)}"
+                    )
+            # Also flag full URLs to non-allowed hosts
+            if s.startswith(("http://", "https://")):
+                host = urlparse(s).hostname
+                if host and host not in ALLOWED_NETWORK_HOSTS:
+                    fail(
+                        f"network call to disallowed host: {host}. "
+                        f"Allowed hosts: {sorted(ALLOWED_NETWORK_HOSTS)}"
+                    )
     info("static checks passed")
 
     # Smoke test: import + call decide() with a fake snapshot
