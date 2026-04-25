@@ -1,0 +1,16 @@
+{
+  "name": "botpit-bot-starter-ts",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx --env-file=.env bot.ts",
+    "start": "tsx bot.ts"
+  },
+  "dependencies": {
+    "tsx": "^4.7.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

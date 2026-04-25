@@ -1,0 +1,29 @@
+# Secrets
+.env
+.env.local
+.env.*.local
+*.token
+*.key
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+.python-version
+.pytest_cache/
+
+# Node / TypeScript
+node_modules/
+dist/
+*.tsbuildinfo
+.npm/
+.pnpm-store/
+
+# OS / editors
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*~
