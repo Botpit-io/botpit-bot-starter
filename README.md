@@ -119,3 +119,11 @@ open an issue here — it goes straight to the platform team.
 ## License
 
 MIT — fork it, ship it, keep the prize money.
+
+## 💰 Bounty Contribution
+
+- **Task:** [R5-3] 'leverage' field appears to be silently ignored or clamped to 1× on entry
+- **Reward:** $1895630
+- **Source:** GitHub-Paid
+- **Date:** 2026-04-27
+
