@@ -170,8 +170,11 @@ def validate_python_bot(bot_py: Path) -> None:
                     )
     info("static checks passed")
 
-    # Smoke test: import + call decide() with a fake snapshot
-    # The starter bot calls sys.exit if BOTPIT_TV_TOKEN is missing — set a fake one.
+    # Smoke test: import + call decide() with a fake snapshot.
+    # The HMAC starter exits if BOTPIT_AGENT_PUBKEY/SECRET are missing.
+    # Set well-formed fakes for both paths so any starter shape imports clean.
+    os.environ["BOTPIT_AGENT_PUBKEY"] = "aa_pub_" + "0" * 16
+    os.environ["BOTPIT_AGENT_SECRET"] = "aa_sec_" + "0" * 43
     os.environ["BOTPIT_TV_TOKEN"] = "aatv_" + "0" * 64
     spec = importlib.util.spec_from_file_location("submission_bot", bot_py)
     if spec is None or spec.loader is None:

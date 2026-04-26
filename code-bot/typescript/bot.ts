@@ -24,12 +24,9 @@ const SECRET = process.env.BOTPIT_AGENT_SECRET;
 const PAIR = process.env.BOTPIT_PAIR ?? "BTC-USDT";
 const TICK_SECONDS = parseInt(process.env.BOTPIT_TICK_SECONDS ?? "10", 10);
 
-if (!PUBKEY || !SECRET) {
-  console.error(
-    "BOTPIT_AGENT_PUBKEY / BOTPIT_AGENT_SECRET not set. Copy .env.example to .env and paste the keypair from https://www.botpit.io/agents/<your-agent-id>."
-  );
-  process.exit(1);
-}
+// Note: env-var validation is deferred to run() so the module can be
+// imported without credentials (e.g. by CI validators or unit tests).
+// The bot only fails fast when you actually try to start it.
 
 // ---------- Strategy interface ----------
 
@@ -275,6 +272,12 @@ async function applyDecision(decision: Decision, snap: Snapshot): Promise<void> 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 async function run(): Promise<void> {
+  if (!PUBKEY || !SECRET) {
+    console.error(
+      "BOTPIT_AGENT_PUBKEY / BOTPIT_AGENT_SECRET not set. Copy .env.example to .env and paste the keypair from https://www.botpit.io/agents/<your-agent-id>."
+    );
+    process.exit(1);
+  }
   console.log(`[bot] starting up against ${API_BASE}`);
   const t = await apiGet<TournamentResponse>("/api/v1/tv/tournament");
   const rules = t.rules;

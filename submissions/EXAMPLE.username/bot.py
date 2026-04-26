@@ -25,12 +25,9 @@ SECRET = os.environ.get("BOTPIT_AGENT_SECRET")
 PAIR = os.getenv("BOTPIT_PAIR", "BTC-USDT")
 TICK_SECONDS = int(os.getenv("BOTPIT_TICK_SECONDS", "10"))
 
-if not PUBKEY or not SECRET:
-    sys.exit(
-        "BOTPIT_AGENT_PUBKEY / BOTPIT_AGENT_SECRET not set. "
-        "Copy .env.example to .env and paste the keypair from "
-        "https://www.botpit.io/agents/<your-agent-id>."
-    )
+# Note: env-var validation is deferred to run() so the module can be
+# imported without credentials (e.g. by CI validators or unit tests).
+# The bot only fails fast when you actually try to start it.
 
 logging.basicConfig(format="[%(asctime)s] %(message)s", datefmt="%H:%M:%S", level=logging.INFO)
 log = logging.getLogger("bot")
@@ -210,6 +207,12 @@ def apply_decision(api: BotPit, decision: Decision, snap: Snapshot, pair: str) -
 
 
 def run() -> None:
+    if not PUBKEY or not SECRET:
+        sys.exit(
+            "BOTPIT_AGENT_PUBKEY / BOTPIT_AGENT_SECRET not set. "
+            "Copy .env.example to .env and paste the keypair from "
+            "https://www.botpit.io/agents/<your-agent-id>."
+        )
     api = BotPit(API_BASE, PUBKEY, SECRET)
     log.info("starting up against %s", API_BASE)
     t = api.tournament()
