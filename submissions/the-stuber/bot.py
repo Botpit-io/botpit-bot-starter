@@ -295,17 +295,31 @@ def decide(snap: Snapshot, mark_price: float) -> Decision:
         return Decision(Action.HOLD)
 
 
+# Tracks the last logged HOLD reason; we only log when the reason changes
+# to keep the signal high without spamming the heartbeat cadence.
+_last_hold_reason: Optional[str] = None
+
+
+def _hold(reason: str) -> Decision:
+    """Return a HOLD decision and log the reason iff it changed since last tick."""
+    global _last_hold_reason
+    if reason != _last_hold_reason:
+        log.info("HOLD: %s", reason)
+        _last_hold_reason = reason
+    return Decision(Action.HOLD)
+
+
 def _decide_inner(snap: Snapshot, mark_price: float) -> Decision:
     # If position is open: maybe move stop to breakeven, then HOLD.
     # All exits are handled by the watcher (stop / TP / BE) — decide() never
     # issues CLOSE itself except via that path.
     if snap.open_position is not None:
         _maybe_breakeven_trail(snap, mark_price)
-        return Decision(Action.HOLD)
+        return _hold(f"managing open {snap.open_position.get('side', '?')} position")
 
     candles = _get_candles(PAIR)
     if len(candles) < 2 * PIVOT_LOOKBACK + 2:
-        return Decision(Action.HOLD)
+        return _hold(f"warming up: {len(candles)} candles cached (need {2 * PIVOT_LOOKBACK + 2})")
 
     long_setup = _detect_long_setup(candles, PIVOT_LOOKBACK)
     if long_setup and long_setup.fib_low <= mark_price <= long_setup.fib_high:
@@ -317,7 +331,26 @@ def _decide_inner(snap: Snapshot, mark_price: float) -> Decision:
         return _entry(long=False, mark_price=mark_price,
                       stop=short_setup.stop, tp=short_setup.take_profit)
 
-    return Decision(Action.HOLD)
+    # No qualifying entry — describe what setups exist and where mark sits.
+    if long_setup is None and short_setup is None:
+        return _hold("no structure break detected (no HH or LL among recent pivots)")
+    if long_setup and short_setup:
+        return _hold(
+            f"both setups present; mark {mark_price:.2f} outside both zones "
+            f"long=[{long_setup.fib_low:.2f}-{long_setup.fib_high:.2f}] "
+            f"short=[{short_setup.fib_low:.2f}-{short_setup.fib_high:.2f}]"
+        )
+    if long_setup:
+        return _hold(
+            f"long setup [origin={long_setup.origin_low:.2f} HH={long_setup.higher_high:.2f}] "
+            f"but mark {mark_price:.2f} outside fib zone "
+            f"[{long_setup.fib_low:.2f}-{long_setup.fib_high:.2f}]"
+        )
+    return _hold(
+        f"short setup [origin={short_setup.origin_high:.2f} LL={short_setup.lower_low:.2f}] "
+        f"but mark {mark_price:.2f} outside fib zone "
+        f"[{short_setup.fib_low:.2f}-{short_setup.fib_high:.2f}]"
+    )
 
 
 def _entry(*, long: bool, mark_price: float, stop: float, tp: float) -> Decision:
