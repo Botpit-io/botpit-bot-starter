@@ -91,6 +91,24 @@ class BotPit:
             return {"status": "rejected", "http": r.status_code, "raw": r.text}
         return r.json()
 
+    def log_decision(self, *, action: str, reason: str,
+                     payload: Optional[Dict[str, Any]] = None) -> None:
+        """Append a decision-trace record to /api/v1/decisions. Lets dashboards
+        render WHY the bot chose what it chose without recomputing the strategy.
+        Fire-and-forget — failures are logged but don't break the tick.
+        Platform caps to last 100 rows per agent automatically."""
+        body_dict: Dict[str, Any] = {"action": action, "reason": reason}
+        if payload is not None:
+            body_dict["payload"] = payload
+        body = json.dumps(body_dict, separators=(",", ":"))
+        try:
+            r = self.session.post(f"{self.base}/api/v1/decisions", data=body,
+                                  headers={**self._sign(body), "Content-Type": "application/json"}, timeout=4)
+            if r.status_code >= 400:
+                log.warning("decision rejected: %s %s", r.status_code, r.text[:200])
+        except requests.RequestException as e:
+            log.warning("decision log failed: %s", e)
+
 
 BINANCE_MARK = "https://fapi.binance.com/fapi/v1/premiumIndex"
 

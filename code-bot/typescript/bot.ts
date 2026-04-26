@@ -142,6 +142,36 @@ async function sendSignal(
   return (await res.json()) as { status: string };
 }
 
+/**
+ * Append a decision-trace record. Lets dashboards render WHY the bot did
+ * what it did without recomputing the strategy. Fire-and-forget — failures
+ * are logged but don't break the tick. Platform caps last 100 per agent.
+ */
+async function logDecision(opts: {
+  action: "hold" | "open_long" | "open_short" | "close";
+  reason: string;
+  payload?: Record<string, unknown>;
+}): Promise<void> {
+  const body = JSON.stringify({
+    action: opts.action,
+    reason: opts.reason,
+    ...(opts.payload ? { payload: opts.payload } : {}),
+  });
+  try {
+    const res = await fetch(`${API_BASE}/api/v1/decisions`, {
+      method: "POST",
+      headers: { ...sign(body), "Content-Type": "application/json" },
+      body,
+    });
+    if (res.status >= 400) {
+      const text = await res.text();
+      console.warn(`[bot] decision rejected: ${res.status} ${text.slice(0, 200)}`);
+    }
+  } catch (e) {
+    console.warn(`[bot] decision log failed: ${(e as Error).message}`);
+  }
+}
+
 // ---------- Mark price (Binance public futures) ----------
 
 async function getMarkPrice(pair: string): Promise<number> {

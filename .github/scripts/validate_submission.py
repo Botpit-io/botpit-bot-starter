@@ -63,6 +63,7 @@ ALLOWED_NETWORK_HOSTS = {
 DOCUMENTED_BOTPIT_PATHS = {
     "/api/v1/signals",        # HMAC code-bot path (default for fresh agents)
     "/api/v1/tv/signals",     # TradingView path
+    "/api/v1/decisions",      # decision-trace appends (HMAC, optional)
     "/api/v1/tv/state",       # read endpoint — HMAC or TV token
     "/api/v1/tv/tournament",  # read endpoint — HMAC or TV token
 }
