@@ -89,6 +89,7 @@ class StopMemory:
     entry_price: Optional[float] = None
     original_stop_pct: Optional[float] = None
     moved_to_breakeven: bool = False
+    last_close_reason: Optional[str] = None  # set by watcher, read by apply_decision for log_decision
 
 
 memory = StopMemory()
@@ -300,14 +301,18 @@ def decide(snap: Snapshot, mark_price: float) -> Decision:
 _last_hold_key: Optional[str] = None
 
 
-def _hold(key: str, message: str) -> Decision:
+def _hold(key: str, message: str, payload: Optional[Dict[str, Any]] = None) -> Decision:
     """Return a HOLD decision and log message iff `key` changed since last tick.
     The key is the *structural* deduplication signal (e.g. setup identity);
-    the message is the human-readable line which may include live mark price."""
+    the message is the human-readable line which may include live mark price.
+    On reason change, also fires a fire-and-forget /api/v1/decisions record so
+    dashboards can render WHY the bot chose to hold (no strategy duplication)."""
     global _last_hold_key
     if key != _last_hold_key:
         log.info("HOLD: %s", message)
         _last_hold_key = key
+        if _api is not None:
+            _api.log_decision(action="hold", reason=message[:280], payload=payload)
     return Decision(Action.HOLD)
 
 
@@ -374,6 +379,13 @@ def _entry(*, long: bool, mark_price: float, stop: float, tp: float) -> Decision
     if sized is None:
         log.info("entry rejected: stop too tight (%.3f%%) for max leverage %d×",
                  stop_dist_pct, MAX_LEVERAGE)
+        if _api is not None:
+            _api.log_decision(
+                action="hold",
+                reason=f"entry rejected: stop too tight ({stop_dist_pct:.3f}%) for max leverage {MAX_LEVERAGE}×",
+                payload={"side": "long" if long else "short", "mark": mark_price,
+                         "stop": stop, "stop_dist_pct": stop_dist_pct, "max_lev": MAX_LEVERAGE},
+            )
         return Decision(Action.HOLD)
     size_pct, leverage = sized
 
@@ -381,6 +393,19 @@ def _entry(*, long: bool, mark_price: float, stop: float, tp: float) -> Decision
     memory.entry_price = mark_price
     memory.original_stop_pct = stop_dist_pct
     memory.moved_to_breakeven = False
+
+    side = "long" if long else "short"
+    if _api is not None:
+        _api.log_decision(
+            action=f"open_{side}",
+            reason=(
+                f"open {side} @ {mark_price:.2f}, stop {stop:.2f} ({stop_dist_pct:.2f}%), "
+                f"tp {tp:.2f} ({tp_dist_pct:.2f}%), sized {size_pct:.1f}% × {leverage}×"
+            )[:280],
+            payload={"side": side, "entry": mark_price, "stop": stop, "tp": tp,
+                     "stop_dist_pct": stop_dist_pct, "tp_dist_pct": tp_dist_pct,
+                     "size_pct": size_pct, "leverage": leverage},
+        )
 
     return Decision(
         action=Action.OPEN_LONG if long else Action.OPEN_SHORT,
@@ -472,6 +497,35 @@ class BotPit:
             return {"status": "rejected", "http": r.status_code, "raw": r.text}
         return r.json()
 
+    def log_decision(self, *, action: str, reason: str,
+                     payload: Optional[Dict[str, Any]] = None) -> None:
+        """Append a decision-trace record to /api/v1/decisions. Lets dashboards
+        render WHY the bot chose what it chose without recomputing the strategy.
+        Fire-and-forget — failures are logged but don't break the tick.
+        Platform caps to last 100 rows per agent automatically."""
+        body_dict: Dict[str, Any] = {"action": action, "reason": reason}
+        if payload is not None:
+            body_dict["payload"] = payload
+        body = json.dumps(body_dict, separators=(",", ":"))
+        try:
+            r = self.session.post(
+                f"{self.base}/api/v1/decisions",
+                data=body,
+                headers={**self._sign(body), "Content-Type": "application/json"},
+                timeout=4,
+            )
+            if r.status_code >= 400:
+                log.warning("decision rejected: %s %s", r.status_code, r.text[:200])
+        except requests.RequestException as e:
+            log.warning("decision log failed: %s", e)
+
+
+# Module-level reference to the BotPit client so strategy helpers (`_hold`,
+# `_entry`) can fire decision-trace records without threading the api object
+# through every signature. Set in `run()`; None during the validator's
+# import-time smoke test.
+_api: Optional["BotPit"] = None
+
 
 BINANCE_MARK = "https://fapi.binance.com/fapi/v1/premiumIndex"
 
@@ -489,17 +543,33 @@ def watch_stops(snap: Snapshot, mark_price: float) -> Optional[Decision]:
     side = snap.open_position["side"]
     if memory.stop_price is not None:
         if side == "long" and mark_price <= memory.stop_price:
-            log.info("STOP HIT (long) — mark %.2f <= stop %.2f", mark_price, memory.stop_price)
+            reason = (
+                f"BE close (long) — mark {mark_price:.2f} ≤ entry-stop {memory.stop_price:.2f}"
+                if memory.moved_to_breakeven
+                else f"stop hit (long) — mark {mark_price:.2f} ≤ stop {memory.stop_price:.2f}"
+            )
+            log.info(reason)
+            memory.last_close_reason = reason
             return Decision(Action.CLOSE)
         if side == "short" and mark_price >= memory.stop_price:
-            log.info("STOP HIT (short) — mark %.2f >= stop %.2f", mark_price, memory.stop_price)
+            reason = (
+                f"BE close (short) — mark {mark_price:.2f} ≥ entry-stop {memory.stop_price:.2f}"
+                if memory.moved_to_breakeven
+                else f"stop hit (short) — mark {mark_price:.2f} ≥ stop {memory.stop_price:.2f}"
+            )
+            log.info(reason)
+            memory.last_close_reason = reason
             return Decision(Action.CLOSE)
     if memory.take_profit_price is not None:
         if side == "long" and mark_price >= memory.take_profit_price:
-            log.info("TP HIT (long) — mark %.2f >= tp %.2f", mark_price, memory.take_profit_price)
+            reason = f"TP hit (long) — mark {mark_price:.2f} ≥ tp {memory.take_profit_price:.2f}"
+            log.info(reason)
+            memory.last_close_reason = reason
             return Decision(Action.CLOSE)
         if side == "short" and mark_price <= memory.take_profit_price:
-            log.info("TP HIT (short) — mark %.2f <= tp %.2f", mark_price, memory.take_profit_price)
+            reason = f"TP hit (short) — mark {mark_price:.2f} ≤ tp {memory.take_profit_price:.2f}"
+            log.info(reason)
+            memory.last_close_reason = reason
             return Decision(Action.CLOSE)
     return None
 
@@ -552,11 +622,21 @@ def apply_decision(api: BotPit, decision: Decision, snap: Snapshot, pair: str) -
             return
         resp = api.send_signal(side="close", pair=pair, size_pct=100, leverage=1)
         log.info("CLOSE sent -> %s", resp.get("status"))
+        if _api is not None:
+            close_reason = memory.last_close_reason or "close (manual or unknown trigger)"
+            _api.log_decision(
+                action="close",
+                reason=close_reason[:280],
+                payload={"pair": pair, "side_closed": snap.open_position.get("side"),
+                         "entry": memory.entry_price,
+                         "moved_to_breakeven": memory.moved_to_breakeven},
+            )
         memory.stop_price = None
         memory.take_profit_price = None
         memory.entry_price = None
         memory.original_stop_pct = None
         memory.moved_to_breakeven = False
+        memory.last_close_reason = None
 
 
 def run() -> None:
@@ -569,6 +649,8 @@ def run() -> None:
         )
 
     api = BotPit(API_BASE, PUBKEY, SECRET)
+    global _api
+    _api = api  # let _hold/_entry helpers fire decision-trace records
     log.info("The Stuber starting up against %s", API_BASE)
     t = api.tournament()
     rules, tournament = t["rules"], t["tournament"]
