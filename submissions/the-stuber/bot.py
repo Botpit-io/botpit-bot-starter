@@ -295,17 +295,19 @@ def decide(snap: Snapshot, mark_price: float) -> Decision:
         return Decision(Action.HOLD)
 
 
-# Tracks the last logged HOLD reason; we only log when the reason changes
-# to keep the signal high without spamming the heartbeat cadence.
-_last_hold_reason: Optional[str] = None
+# Tracks the last logged HOLD key; we only log when the structural reason
+# changes (different setup, different zone), not when mark price drifts.
+_last_hold_key: Optional[str] = None
 
 
-def _hold(reason: str) -> Decision:
-    """Return a HOLD decision and log the reason iff it changed since last tick."""
-    global _last_hold_reason
-    if reason != _last_hold_reason:
-        log.info("HOLD: %s", reason)
-        _last_hold_reason = reason
+def _hold(key: str, message: str) -> Decision:
+    """Return a HOLD decision and log message iff `key` changed since last tick.
+    The key is the *structural* deduplication signal (e.g. setup identity);
+    the message is the human-readable line which may include live mark price."""
+    global _last_hold_key
+    if key != _last_hold_key:
+        log.info("HOLD: %s", message)
+        _last_hold_key = key
     return Decision(Action.HOLD)
 
 
@@ -314,12 +316,15 @@ def _decide_inner(snap: Snapshot, mark_price: float) -> Decision:
     # All exits are handled by the watcher (stop / TP / BE) — decide() never
     # issues CLOSE itself except via that path.
     if snap.open_position is not None:
-        _maybe_breakeven_trail(snap, mark_price)
-        return _hold(f"managing open {snap.open_position.get('side', '?')} position")
+        side = snap.open_position.get("side", "?")
+        return _hold(f"managing:{side}", f"managing open {side} position")
 
     candles = _get_candles(PAIR)
     if len(candles) < 2 * PIVOT_LOOKBACK + 2:
-        return _hold(f"warming up: {len(candles)} candles cached (need {2 * PIVOT_LOOKBACK + 2})")
+        return _hold(
+            f"warming:{len(candles)}",
+            f"warming up: {len(candles)} candles cached (need {2 * PIVOT_LOOKBACK + 2})",
+        )
 
     long_setup = _detect_long_setup(candles, PIVOT_LOOKBACK)
     if long_setup and long_setup.fib_low <= mark_price <= long_setup.fib_high:
@@ -332,24 +337,30 @@ def _decide_inner(snap: Snapshot, mark_price: float) -> Decision:
                       stop=short_setup.stop, tp=short_setup.take_profit)
 
     # No qualifying entry — describe what setups exist and where mark sits.
+    # Dedup keys exclude live mark price so a pulling-back BTC doesn't re-log every tick;
+    # the printed message includes mark for human readability.
     if long_setup is None and short_setup is None:
-        return _hold("no structure break detected (no HH or LL among recent pivots)")
+        return _hold("none", "no structure break detected (no HH or LL among recent pivots)")
     if long_setup and short_setup:
         return _hold(
+            f"both:{long_setup.origin_low:.0f}-{long_setup.higher_high:.0f}|"
+            f"{short_setup.origin_high:.0f}-{short_setup.lower_low:.0f}",
             f"both setups present; mark {mark_price:.2f} outside both zones "
             f"long=[{long_setup.fib_low:.2f}-{long_setup.fib_high:.2f}] "
-            f"short=[{short_setup.fib_low:.2f}-{short_setup.fib_high:.2f}]"
+            f"short=[{short_setup.fib_low:.2f}-{short_setup.fib_high:.2f}]",
         )
     if long_setup:
         return _hold(
+            f"long:{long_setup.origin_low:.0f}-{long_setup.higher_high:.0f}",
             f"long setup [origin={long_setup.origin_low:.2f} HH={long_setup.higher_high:.2f}] "
             f"but mark {mark_price:.2f} outside fib zone "
-            f"[{long_setup.fib_low:.2f}-{long_setup.fib_high:.2f}]"
+            f"[{long_setup.fib_low:.2f}-{long_setup.fib_high:.2f}]",
         )
     return _hold(
+        f"short:{short_setup.origin_high:.0f}-{short_setup.lower_low:.0f}",
         f"short setup [origin={short_setup.origin_high:.2f} LL={short_setup.lower_low:.2f}] "
         f"but mark {mark_price:.2f} outside fib zone "
-        f"[{short_setup.fib_low:.2f}-{short_setup.fib_high:.2f}]"
+        f"[{short_setup.fib_low:.2f}-{short_setup.fib_high:.2f}]",
     )
 
 
