@@ -44,6 +44,13 @@ MAX_LEVERAGE = int(os.getenv("STUBER_MAX_LEVERAGE", "20"))
 CANDLES_TO_FETCH = int(os.getenv("STUBER_CANDLES", "100"))
 CANDLE_REFRESH_SECONDS = int(os.getenv("STUBER_CANDLE_REFRESH", "60"))
 
+# Higher-timeframe trend filter (R6-3 — trend-of-trend)
+# Skip 15m shorts when the most recent 4h structure was a bullish break (HH > prior HH),
+# and 15m longs when the most recent 4h structure was a bearish break (LL < prior LL).
+HTF_TIMEFRAME = os.getenv("STUBER_HTF_TIMEFRAME", "4h")
+HTF_PIVOT_N = int(os.getenv("STUBER_HTF_PIVOT_N", "5"))
+HTF_CANDLE_REFRESH_SECONDS = int(os.getenv("STUBER_HTF_CANDLE_REFRESH", "300"))  # 5 min
+
 logging.basicConfig(format="[%(asctime)s] %(message)s", datefmt="%H:%M:%S", level=logging.INFO)
 log = logging.getLogger("the-stuber")
 
@@ -145,6 +152,54 @@ def _get_candles(pair: str, timeframe: str = TIMEFRAME) -> List[Candle]:
         except Exception as e:
             log.warning("candle fetch failed: %s — using cache (%d candles)", e, len(_candle_cache))
     return _candle_cache
+
+
+# Higher-timeframe candle cache for the trend-of-trend filter (R6-3).
+_htf_candle_cache: List[Candle] = []
+_htf_candle_cache_at: float = 0.0
+
+
+def _get_htf_candles(pair: str = PAIR) -> List[Candle]:
+    """Same shape as _get_candles but for the higher timeframe used by the
+    trend-of-trend filter. Refreshes every HTF_CANDLE_REFRESH_SECONDS (default
+    5 min) since 4h candles change rarely."""
+    global _htf_candle_cache, _htf_candle_cache_at
+    now = time.time()
+    if not _htf_candle_cache or (now - _htf_candle_cache_at) > HTF_CANDLE_REFRESH_SECONDS:
+        try:
+            _htf_candle_cache = _fetch_candles(pair, HTF_TIMEFRAME, CANDLES_TO_FETCH)
+            _htf_candle_cache_at = now
+        except Exception as e:
+            log.warning("HTF candle fetch failed: %s — using cache (%d candles)", e, len(_htf_candle_cache))
+    return _htf_candle_cache
+
+
+def _detect_htf_trend(candles: List[Candle], n: int) -> str:
+    """Returns 'bullish' | 'bearish' | 'neutral' based on the most recent
+    confirmed structure event on the higher timeframe.
+
+    'bullish' = most recent confirmed pivot high broke the prior pivot high
+                AND that event is more recent than any LL break.
+    'bearish' = mirror with pivot lows.
+    'neutral' = neither break is confirmed (or not enough candles)."""
+    pivot_highs, pivot_lows = _find_pivots(candles, n)
+
+    bullish_break_idx = None
+    if len(pivot_highs) >= 2 and candles[pivot_highs[-1]].high > candles[pivot_highs[-2]].high:
+        bullish_break_idx = pivot_highs[-1]
+
+    bearish_break_idx = None
+    if len(pivot_lows) >= 2 and candles[pivot_lows[-1]].low < candles[pivot_lows[-2]].low:
+        bearish_break_idx = pivot_lows[-1]
+
+    if bullish_break_idx is None and bearish_break_idx is None:
+        return "neutral"
+    if bullish_break_idx is None:
+        return "bearish"
+    if bearish_break_idx is None:
+        return "bullish"
+    # Both confirmed — whichever pivot is more recent wins
+    return "bullish" if bullish_break_idx > bearish_break_idx else "bearish"
 
 
 # ---------- Fractal pivot detection ----------
@@ -331,13 +386,34 @@ def _decide_inner(snap: Snapshot, mark_price: float) -> Decision:
             f"warming up: {len(candles)} candles cached (need {2 * PIVOT_LOOKBACK + 2})",
         )
 
+    # R6-3: trend-of-trend filter — skip entries that disagree with the higher-timeframe
+    # structure. Computed once per tick; "neutral" means no confirmed HTF break, allow either side.
+    htf_candles = _get_htf_candles(PAIR)
+    htf_trend = (
+        _detect_htf_trend(htf_candles, HTF_PIVOT_N)
+        if len(htf_candles) >= 2 * HTF_PIVOT_N + 2
+        else "neutral"
+    )
+
     long_setup = _detect_long_setup(candles, PIVOT_LOOKBACK)
     if long_setup and long_setup.fib_low <= mark_price <= long_setup.fib_high:
+        if htf_trend == "bearish":
+            return _hold(
+                f"htf-skip-long:{long_setup.origin_low:.0f}-{long_setup.higher_high:.0f}",
+                f"long setup [origin={long_setup.origin_low:.2f} HH={long_setup.higher_high:.2f}] "
+                f"in zone but {HTF_TIMEFRAME} trend is bearish — skipping per trend-of-trend filter",
+            )
         return _entry(long=True, mark_price=mark_price,
                       stop=long_setup.stop, tp=long_setup.take_profit)
 
     short_setup = _detect_short_setup(candles, PIVOT_LOOKBACK)
     if short_setup and short_setup.fib_low <= mark_price <= short_setup.fib_high:
+        if htf_trend == "bullish":
+            return _hold(
+                f"htf-skip-short:{short_setup.origin_high:.0f}-{short_setup.lower_low:.0f}",
+                f"short setup [origin={short_setup.origin_high:.2f} LL={short_setup.lower_low:.2f}] "
+                f"in zone but {HTF_TIMEFRAME} trend is bullish — skipping per trend-of-trend filter",
+            )
         return _entry(long=False, mark_price=mark_price,
                       stop=short_setup.stop, tp=short_setup.take_profit)
 
