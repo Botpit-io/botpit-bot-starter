@@ -97,9 +97,15 @@ class StopMemory:
     original_stop_pct: Optional[float] = None
     moved_to_breakeven: bool = False
     last_close_reason: Optional[str] = None  # set by watcher, read by apply_decision for log_decision
+    last_close_emit_at: Optional[float] = None  # epoch seconds; throttles CLOSE re-emit (R6-9)
 
 
 memory = StopMemory()
+
+# R6-9 hardening constants.
+CLOSE_RETRY_THROTTLE_S = 60.0       # don't re-emit CLOSE more than once per minute
+ORPHAN_FALLBACK_STOP_PCT = 1.5      # conservative stop installed for orphaned positions
+ORPHAN_FALLBACK_TP_PCT = 3.0
 
 
 # ---------- Candle cache (Binance public klines) ----------
@@ -616,6 +622,12 @@ def get_mark_price(pair: str) -> float:
 def watch_stops(snap: Snapshot, mark_price: float) -> Optional[Decision]:
     if snap.open_position is None:
         return None
+    # R6-9 throttle: don't re-emit CLOSE more than once per CLOSE_RETRY_THROTTLE_S.
+    # If a recent CLOSE didn't fill (queued forever bug), the watcher would
+    # otherwise spam CLOSEs every tick.
+    if memory.last_close_emit_at is not None:
+        if time.time() - memory.last_close_emit_at < CLOSE_RETRY_THROTTLE_S:
+            return None
     side = snap.open_position["side"]
     if memory.stop_price is not None:
         if side == "long" and mark_price <= memory.stop_price:
@@ -705,14 +717,14 @@ def apply_decision(api: BotPit, decision: Decision, snap: Snapshot, pair: str) -
                 reason=close_reason[:280],
                 payload={"pair": pair, "side_closed": snap.open_position.get("side"),
                          "entry": memory.entry_price,
-                         "moved_to_breakeven": memory.moved_to_breakeven},
+                         "moved_to_breakeven": memory.moved_to_breakeven,
+                         "close_status": resp.get("status")},
             )
-        memory.stop_price = None
-        memory.take_profit_price = None
-        memory.entry_price = None
-        memory.original_stop_pct = None
-        memory.moved_to_breakeven = False
-        memory.last_close_reason = None
+        # R6-9: do NOT clear stop/tp/entry here. The matching engine has been
+        # observed returning `queued` indefinitely without ever filling the
+        # close. Memory is cleared only when build_snapshot() reports the
+        # position is verifiably closed — see the run() loop.
+        memory.last_close_emit_at = time.time()
 
 
 def run() -> None:
@@ -743,6 +755,42 @@ def run() -> None:
         try:
             snap = build_snapshot(api, PAIR, rules)
             mark = get_mark_price(PAIR)
+
+            # R6-9: confirmed-flat clear. Position is verifiably gone, safe to wipe
+            # memory. Replaces the optimistic clear that used to live in
+            # apply_decision()'s CLOSE branch.
+            if snap.open_position is None and memory.entry_price is not None:
+                log.info("position confirmed closed — clearing local stop memory")
+                memory.stop_price = None
+                memory.take_profit_price = None
+                memory.entry_price = None
+                memory.original_stop_pct = None
+                memory.moved_to_breakeven = False
+                memory.last_close_reason = None
+                memory.last_close_emit_at = None
+
+            # R6-9: orphan recovery. Position exists but bot has no stop tracking
+            # — happens after restart, or after a CLOSE was emitted but the
+            # matching engine never filled it. Install a conservative fallback
+            # stop so the position is never silently un-watched.
+            if snap.open_position is not None and memory.entry_price is None:
+                entry = float(snap.open_position["entry_price"])
+                side = snap.open_position["side"]
+                if side == "long":
+                    memory.stop_price = entry * (1 - ORPHAN_FALLBACK_STOP_PCT / 100)
+                    memory.take_profit_price = entry * (1 + ORPHAN_FALLBACK_TP_PCT / 100)
+                else:
+                    memory.stop_price = entry * (1 + ORPHAN_FALLBACK_STOP_PCT / 100)
+                    memory.take_profit_price = entry * (1 - ORPHAN_FALLBACK_TP_PCT / 100)
+                memory.entry_price = entry
+                memory.original_stop_pct = ORPHAN_FALLBACK_STOP_PCT
+                memory.moved_to_breakeven = False
+                log.warning(
+                    "orphan position detected (%s %.4f @ %.2f) — installed fallback stop @ %.2f, tp @ %.2f",
+                    side, snap.open_position.get("size_units", 0.0), entry,
+                    memory.stop_price, memory.take_profit_price,
+                )
+
             stop_decision = watch_stops(snap, mark)
             if stop_decision:
                 apply_decision(api, stop_decision, snap, PAIR)
