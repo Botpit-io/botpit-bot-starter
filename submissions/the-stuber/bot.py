@@ -4,6 +4,8 @@ The Stuber — Fibonacci pullback after structure break.
 Strategy: long/short entries on pullback into the 0.618-0.786 fib zone after
 a confirmed market-structure break. Stop at origin low/high, TP at 1.272
 extension. Risk-based sizing for 3% loss on stop. Breakeven trail at 1R.
+4h trend-of-trend filter (R6-3). News-flat ahead of scheduled high-impact
+macro prints via /api/v1/tv/state's macro_calendar.
 
 Built on the BotPit code-bot starter (HMAC path).
 See STRATEGY.md for the full thesis + weaknesses.
@@ -31,11 +33,11 @@ API_BASE = os.getenv("BOTPIT_API_BASE", "https://www.botpit.io")
 PUBKEY = os.environ.get("BOTPIT_AGENT_PUBKEY")
 SECRET = os.environ.get("BOTPIT_AGENT_SECRET")
 PAIR = os.getenv("BOTPIT_PAIR", "BTC-USDT")
-TIMEFRAME = os.getenv("BOTPIT_TIMEFRAME", "5m")
+TIMEFRAME = os.getenv("BOTPIT_TIMEFRAME", "15m")  # raised from 5m for chop tolerance
 TICK_SECONDS = int(os.getenv("BOTPIT_TICK_SECONDS", "10"))
 
 # Strategy params (tweak via env if needed)
-PIVOT_LOOKBACK = int(os.getenv("STUBER_PIVOT_N", "5"))
+PIVOT_LOOKBACK = int(os.getenv("STUBER_PIVOT_N", "10"))  # raised from 5 for chop tolerance
 FIB_ZONE_LOW = float(os.getenv("STUBER_FIB_LOW", "0.618"))
 FIB_ZONE_HIGH = float(os.getenv("STUBER_FIB_HIGH", "0.786"))
 FIB_TP_EXTENSION = float(os.getenv("STUBER_TP_EXT", "1.272"))
@@ -50,6 +52,15 @@ CANDLE_REFRESH_SECONDS = int(os.getenv("STUBER_CANDLE_REFRESH", "60"))
 HTF_TIMEFRAME = os.getenv("STUBER_HTF_TIMEFRAME", "4h")
 HTF_PIVOT_N = int(os.getenv("STUBER_HTF_PIVOT_N", "5"))
 HTF_CANDLE_REFRESH_SECONDS = int(os.getenv("STUBER_HTF_CANDLE_REFRESH", "300"))  # 5 min
+
+# Macro-event blackout — go news-flat ahead of scheduled high-impact US prints
+# (CPI / NFP / FOMC / …). The economic calendar is served in /api/v1/tv/state as
+# `macro_calendar` (`.next` = soonest high-impact release with name / at / in_minutes).
+# When the next print is within this many minutes: close any open position and
+# decline new entries until the print is out of the way (in_minutes goes negative).
+# Standard prop-firm "no trading around scheduled news" rule; Prop Firm Pete uses 30.
+# Set STUBER_MACRO_BUFFER_MIN=0 to disable.
+MACRO_FLAT_BUFFER_MINUTES = float(os.getenv("STUBER_MACRO_BUFFER_MIN", "30"))
 
 logging.basicConfig(format="[%(asctime)s] %(message)s", datefmt="%H:%M:%S", level=logging.INFO)
 log = logging.getLogger("the-stuber")
@@ -81,6 +92,7 @@ class Snapshot:
     open_position: Optional[Dict[str, Any]]
     last_fill_price: Optional[float]
     pair_config: Dict[str, Any]
+    macro_calendar: Optional[Dict[str, Any]] = None  # /api/v1/tv/state `macro_calendar` block, if present
 
 
 @dataclass
@@ -342,6 +354,33 @@ def _size_for_risk(
     return None
 
 
+# ---------- Macro-event blackout (news-flat) ----------
+
+def _macro_blackout(snap: "Snapshot") -> Optional[Tuple[str, float]]:
+    """If a scheduled high-impact release is within MACRO_FLAT_BUFFER_MINUTES
+    and hasn't happened yet, return (event_name, minutes_until). Otherwise None.
+
+    Reads `macro_calendar.next` from /api/v1/tv/state — tolerant of the block
+    being absent (older state payloads) or `next` being null. Once the print is
+    past, `in_minutes` goes negative and trading resumes."""
+    if MACRO_FLAT_BUFFER_MINUTES <= 0:
+        return None
+    cal = snap.macro_calendar
+    if not cal:
+        return None
+    nxt = cal.get("next")
+    if not nxt:
+        return None
+    mins = nxt.get("in_minutes")
+    try:
+        mins = float(mins)
+    except (TypeError, ValueError):
+        return None
+    if 0.0 <= mins < MACRO_FLAT_BUFFER_MINUTES:
+        return str(nxt.get("name") or "high-impact release"), mins
+    return None
+
+
 # ---------- The Stuber strategy ----------
 
 def decide(snap: Snapshot, mark_price: float) -> Decision:
@@ -384,6 +423,17 @@ def _decide_inner(snap: Snapshot, mark_price: float) -> Decision:
     if snap.open_position is not None:
         side = snap.open_position.get("side", "?")
         return _hold(f"managing:{side}", f"managing open {side} position")
+
+    # News-flat: don't open into a scheduled high-impact print (the watcher
+    # handles closing any *existing* position — see watch_stops()).
+    blackout = _macro_blackout(snap)
+    if blackout is not None:
+        name, mins = blackout
+        return _hold(
+            f"news-flat:{name}",
+            f"news-flat — {name} in {mins:.0f}m (≤ {MACRO_FLAT_BUFFER_MINUTES:.0f}m buffer); "
+            f"declining new entries until the print is out of the way",
+        )
 
     candles = _get_candles(PAIR)
     if len(candles) < 2 * PIVOT_LOOKBACK + 2:
@@ -629,6 +679,17 @@ def watch_stops(snap: Snapshot, mark_price: float) -> Optional[Decision]:
         if time.time() - memory.last_close_emit_at < CLOSE_RETRY_THROTTLE_S:
             return None
     side = snap.open_position["side"]
+    # News-flat: flatten ahead of a scheduled high-impact print, regardless of stop/TP.
+    # Standard prop-firm rule — don't leave a leveraged position orphaned across an
+    # event you didn't see coming ("the 37 minutes that weren't there").
+    blackout = _macro_blackout(snap)
+    if blackout is not None:
+        name, mins = blackout
+        reason = (f"news-flat close ({side}) — {name} in {mins:.0f}m "
+                  f"(≤ {MACRO_FLAT_BUFFER_MINUTES:.0f}m buffer); flat is flat")
+        log.info(reason)
+        memory.last_close_reason = reason
+        return Decision(Action.CLOSE)
     if memory.stop_price is not None:
         if side == "long" and mark_price <= memory.stop_price:
             reason = (
@@ -678,6 +739,7 @@ def build_snapshot(api: BotPit, pair: str, rules: dict) -> Snapshot:
         open_position=open_pos,
         last_fill_price=last_fill_price,
         pair_config=rules,
+        macro_calendar=s.get("macro_calendar"),
     )
 
 
