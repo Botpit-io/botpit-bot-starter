@@ -120,9 +120,26 @@ ORPHAN_FALLBACK_STOP_PCT = 1.5      # conservative stop installed for orphaned p
 ORPHAN_FALLBACK_TP_PCT = 3.0
 
 
-# ---------- Candle cache (Binance public klines) ----------
+# ---------- Market data (Binance primary, Bybit fallback) ----------
+#
+# Both candles and the mark price come from a single venue by default — and on a
+# shared-NAT PaaS (Railway/Render/Fly/…) the egress IP's reputation with that
+# venue is outside our control: another tenant hammering the same IP gets it
+# 418'd by Binance, and we inherit the ban (cf. R6-16). So: try Binance first,
+# fall back to Bybit linear perps (no API key, different IP-rep surface). If both
+# fail, the callers' existing behaviour stands (candles → cache, mark → retry).
 
 BINANCE_KLINES = "https://fapi.binance.com/fapi/v1/klines"
+BINANCE_MARK = "https://fapi.binance.com/fapi/v1/premiumIndex"
+BYBIT_KLINES = "https://api.bybit.com/v5/market/kline"
+BYBIT_TICKERS = "https://api.bybit.com/v5/market/tickers"
+
+# Binance interval string -> Bybit v5 interval code.
+_BYBIT_INTERVAL = {
+    "1m": "1", "3m": "3", "5m": "5", "15m": "15", "30m": "30",
+    "1h": "60", "2h": "120", "4h": "240", "6h": "360", "12h": "720",
+    "1d": "D", "1w": "W", "1M": "M",
+}
 
 
 @dataclass
@@ -138,7 +155,7 @@ _candle_cache: List[Candle] = []
 _candle_cache_at: float = 0.0
 
 
-def _fetch_candles(pair: str, timeframe: str, limit: int) -> List[Candle]:
+def _fetch_candles_binance(pair: str, timeframe: str, limit: int) -> List[Candle]:
     symbol = pair.replace("-", "")
     r = requests.get(
         BINANCE_KLINES,
@@ -156,6 +173,39 @@ def _fetch_candles(pair: str, timeframe: str, limit: int) -> List[Candle]:
         )
         for k in r.json()
     ]
+
+
+def _fetch_candles_bybit(pair: str, timeframe: str, limit: int) -> List[Candle]:
+    symbol = pair.replace("-", "")
+    interval = _BYBIT_INTERVAL.get(timeframe)
+    if interval is None:
+        raise ValueError(f"no Bybit interval mapping for timeframe {timeframe!r}")
+    r = requests.get(
+        BYBIT_KLINES,
+        params={"category": "linear", "symbol": symbol,
+                "interval": interval, "limit": min(limit, 1000)},
+        timeout=5,
+    )
+    r.raise_for_status()
+    data = r.json()
+    if data.get("retCode") != 0:
+        raise RuntimeError(f"Bybit kline error {data.get('retCode')}: {data.get('retMsg')}")
+    rows = data["result"]["list"]  # Bybit returns newest-first: [start, o, h, l, c, vol, turnover]
+    candles = [
+        Candle(open_time=int(k[0]), open=float(k[1]), high=float(k[2]),
+               low=float(k[3]), close=float(k[4]))
+        for k in rows
+    ]
+    candles.reverse()  # oldest-first, to match Binance ordering
+    return candles
+
+
+def _fetch_candles(pair: str, timeframe: str, limit: int) -> List[Candle]:
+    try:
+        return _fetch_candles_binance(pair, timeframe, limit)
+    except Exception as e:
+        log.warning("Binance klines failed (%s) — falling back to Bybit", e)
+        return _fetch_candles_bybit(pair, timeframe, limit)
 
 
 def _get_candles(pair: str, timeframe: str = TIMEFRAME) -> List[Candle]:
@@ -659,14 +709,33 @@ class BotPit:
 _api: Optional["BotPit"] = None
 
 
-BINANCE_MARK = "https://fapi.binance.com/fapi/v1/premiumIndex"
-
-
-def get_mark_price(pair: str) -> float:
+def _mark_binance(pair: str) -> float:
     symbol = pair.replace("-", "")
     r = requests.get(BINANCE_MARK, params={"symbol": symbol}, timeout=5)
     r.raise_for_status()
     return float(r.json()["markPrice"])
+
+
+def _mark_bybit(pair: str) -> float:
+    symbol = pair.replace("-", "")
+    r = requests.get(BYBIT_TICKERS, params={"category": "linear", "symbol": symbol}, timeout=5)
+    r.raise_for_status()
+    data = r.json()
+    if data.get("retCode") != 0:
+        raise RuntimeError(f"Bybit ticker error {data.get('retCode')}: {data.get('retMsg')}")
+    lst = data["result"]["list"]
+    if not lst:
+        raise RuntimeError(f"Bybit ticker: no data for {symbol}")
+    t = lst[0]
+    return float(t.get("markPrice") or t["lastPrice"])
+
+
+def get_mark_price(pair: str) -> float:
+    try:
+        return _mark_binance(pair)
+    except Exception as e:
+        log.warning("Binance mark price failed (%s) — falling back to Bybit", e)
+        return _mark_bybit(pair)
 
 
 def watch_stops(snap: Snapshot, mark_price: float) -> Optional[Decision]:
