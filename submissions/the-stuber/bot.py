@@ -13,6 +13,7 @@ See STRATEGY.md for the full thesis + weaknesses.
 
 from __future__ import annotations
 
+import calendar
 import enum
 import hashlib
 import hmac
@@ -120,19 +121,28 @@ ORPHAN_FALLBACK_STOP_PCT = 1.5      # conservative stop installed for orphaned p
 ORPHAN_FALLBACK_TP_PCT = 3.0
 
 
-# ---------- Market data (Binance primary, Bybit fallback) ----------
+# ---------- Market data (Binance primary, FMP + Bybit fallbacks) ----------
 #
 # Both candles and the mark price come from a single venue by default — and on a
 # shared-NAT PaaS (Railway/Render/Fly/…) the egress IP's reputation with that
 # venue is outside our control: another tenant hammering the same IP gets it
-# 418'd by Binance, and we inherit the ban (cf. R6-16). So: try Binance first,
-# fall back to Bybit linear perps (no API key, different IP-rep surface). If both
-# fail, the callers' existing behaviour stands (candles → cache, mark → retry).
+# 418'd by Binance, and we inherit the ban (cf. R6-16). So we chain sources,
+# each on an independent IP-rep surface:
+#   1. Binance USDⓈ-M futures  — primary; the right number (perp mark price), free
+#   2. FMP crypto feed         — used iff STUBER_FMP_KEY is set; paid → reliable;
+#                                aggregated spot, so a small basis vs. perp mark —
+#                                fine for a degraded fallback
+#   3. Bybit linear perps      — last resort; free, no key
+# If all configured sources fail, callers' existing behaviour stands
+# (candles → cache, mark → run() retry loop).
 
 BINANCE_KLINES = "https://fapi.binance.com/fapi/v1/klines"
 BINANCE_MARK = "https://fapi.binance.com/fapi/v1/premiumIndex"
 BYBIT_KLINES = "https://api.bybit.com/v5/market/kline"
 BYBIT_TICKERS = "https://api.bybit.com/v5/market/tickers"
+FMP_QUOTE = "https://financialmodelingprep.com/api/v3/quote"
+FMP_CHART = "https://financialmodelingprep.com/api/v3/historical-chart"
+FMP_API_KEY = os.getenv("STUBER_FMP_KEY", "").strip()  # optional; financialmodelingprep.com
 
 # Binance interval string -> Bybit v5 interval code.
 _BYBIT_INTERVAL = {
@@ -140,6 +150,16 @@ _BYBIT_INTERVAL = {
     "1h": "60", "2h": "120", "4h": "240", "6h": "360", "12h": "720",
     "1d": "D", "1w": "W", "1M": "M",
 }
+# Binance interval string -> FMP historical-chart interval slug (intraday only).
+_FMP_INTERVAL = {
+    "1m": "1min", "5m": "5min", "15m": "15min", "30m": "30min",
+    "1h": "1hour", "4h": "4hour",
+}
+
+
+def _fmp_symbol(pair: str) -> str:
+    """BotPit pair (e.g. BTC-USDT) -> FMP crypto symbol (e.g. BTCUSD)."""
+    return pair.split("-")[0].upper() + "USD"
 
 
 @dataclass
@@ -200,12 +220,44 @@ def _fetch_candles_bybit(pair: str, timeframe: str, limit: int) -> List[Candle]:
     return candles
 
 
+def _fetch_candles_fmp(pair: str, timeframe: str, limit: int) -> List[Candle]:
+    if not FMP_API_KEY:
+        raise RuntimeError("no FMP API key configured (set STUBER_FMP_KEY)")
+    interval = _FMP_INTERVAL.get(timeframe)
+    if interval is None:
+        raise ValueError(f"no FMP interval mapping for timeframe {timeframe!r}")
+    r = requests.get(
+        f"{FMP_CHART}/{interval}/{_fmp_symbol(pair)}",
+        params={"apikey": FMP_API_KEY},
+        timeout=5,
+    )
+    r.raise_for_status()
+    rows = r.json()  # newest-first: [{"date","open","low","high","close","volume"}, ...]
+    if not isinstance(rows, list) or not rows:
+        raise RuntimeError(f"FMP chart: no data for {_fmp_symbol(pair)} {interval}")
+    candles: List[Candle] = []
+    for k in rows[:limit]:
+        try:
+            ot = int(calendar.timegm(time.strptime(k["date"], "%Y-%m-%d %H:%M:%S")) * 1000)
+        except (KeyError, ValueError, TypeError):
+            ot = 0
+        candles.append(Candle(open_time=ot, open=float(k["open"]), high=float(k["high"]),
+                              low=float(k["low"]), close=float(k["close"])))
+    candles.reverse()  # oldest-first, to match Binance ordering
+    return candles
+
+
 def _fetch_candles(pair: str, timeframe: str, limit: int) -> List[Candle]:
     try:
         return _fetch_candles_binance(pair, timeframe, limit)
     except Exception as e:
-        log.warning("Binance klines failed (%s) — falling back to Bybit", e)
-        return _fetch_candles_bybit(pair, timeframe, limit)
+        log.warning("Binance klines failed (%s) — trying next source", e)
+    if FMP_API_KEY:
+        try:
+            return _fetch_candles_fmp(pair, timeframe, limit)
+        except Exception as e:
+            log.warning("FMP klines failed (%s) — trying Bybit", e)
+    return _fetch_candles_bybit(pair, timeframe, limit)
 
 
 def _get_candles(pair: str, timeframe: str = TIMEFRAME) -> List[Candle]:
@@ -730,12 +782,31 @@ def _mark_bybit(pair: str) -> float:
     return float(t.get("markPrice") or t["lastPrice"])
 
 
+def _mark_fmp(pair: str) -> float:
+    if not FMP_API_KEY:
+        raise RuntimeError("no FMP API key configured (set STUBER_FMP_KEY)")
+    r = requests.get(f"{FMP_QUOTE}/{_fmp_symbol(pair)}", params={"apikey": FMP_API_KEY}, timeout=5)
+    r.raise_for_status()
+    data = r.json()
+    if not isinstance(data, list) or not data:
+        raise RuntimeError(f"FMP quote: no data for {_fmp_symbol(pair)}")
+    px = data[0].get("price")
+    if px is None:
+        raise RuntimeError(f"FMP quote: no price field for {_fmp_symbol(pair)}")
+    return float(px)
+
+
 def get_mark_price(pair: str) -> float:
     try:
         return _mark_binance(pair)
     except Exception as e:
-        log.warning("Binance mark price failed (%s) — falling back to Bybit", e)
-        return _mark_bybit(pair)
+        log.warning("Binance mark price failed (%s) — trying next source", e)
+    if FMP_API_KEY:
+        try:
+            return _mark_fmp(pair)
+        except Exception as e:
+            log.warning("FMP mark price failed (%s) — trying Bybit", e)
+    return _mark_bybit(pair)
 
 
 def watch_stops(snap: Snapshot, mark_price: float) -> Optional[Decision]:
