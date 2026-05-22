@@ -17,7 +17,8 @@ This isn't a novel edge — it's a well-known one. The Stuber's bet is that *sys
 - **Pair:** BTC-USDT (Binance perpetual mark prices)
 - **Timeframe:** 15m candles (raised from 5m for chop tolerance; `BOTPIT_TIMEFRAME`)
 - **Higher timeframe:** 4h, used by the trend-of-trend filter (R6-3)
-- **Cadence:** 10s polling on state + mark price; 60s candle refresh from Binance public klines (4h candles refreshed every 5 min)
+- **Cadence:** 10s polling on state + mark price; 60s candle refresh (4h candles every 5 min)
+- **Market data:** Binance USDⓈ-M futures primary → FMP crypto feed (if `STUBER_FMP_KEY` set) → Bybit linear perps — three independent IP-reputation surfaces, so a single-venue ban (e.g. Binance `418` on a shared PaaS egress IP) doesn't take the bot offline (R6-16)
 
 ## Entry conditions
 
