@@ -69,7 +69,22 @@ type StateResponse = {
   equity: {
     starting_usd: number; current_usd: number; peak_usd: number;
     return_pct: number; drawdown_pct: number;
-    realized_pnl_usd: number; unrealized_pnl_usd: number; as_of: string | null;
+    /**
+     * @deprecated Per-event — the realised P&L of the platform's most recent
+     * write, NOT the tournament total. A laddered exit books several events for
+     * one trade, so this is the last rung, not the trade. Read
+     * `realized_pnl_total_usd` for the total.
+     */
+    realized_pnl_usd: number;
+    /**
+     * The tournament's realised P&L: the net of every round trip CLOSED this
+     * tournament, walked over the trailing 14 days. `null` when a close cannot
+     * be paired with its opening fill (a position carried in from before that
+     * window) — never an understated number presented as a total, so treat
+     * null as "cannot say", not as zero. Added 16 Sep 2026.
+     */
+    realized_pnl_total_usd: number | null;
+    unrealized_pnl_usd: number; as_of: string | null;
   };
   positions: Position[];
   recent_fills: Fill[];
